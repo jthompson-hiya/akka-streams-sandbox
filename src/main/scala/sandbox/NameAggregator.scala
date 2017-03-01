@@ -3,18 +3,25 @@ package sandbox
 import com.typesafe.config.ConfigFactory
 import akka.actor.ActorSystem
 import akka.stream.ActorMaterializer
-import com.softwaremill.react.kafka.ConsumerProperties
 import org.apache.kafka.common.serialization.StringDeserializer
-import com.softwaremill.react.kafka.ProducerProperties
 import org.apache.kafka.common.serialization.StringSerializer
 import org.scalacheck.Gen
 import akka.stream.scaladsl.Source
 import akka.stream.scaladsl.Sink
-import com.softwaremill.react.kafka.ProducerMessage
-import com.softwaremill.react.kafka.ReactiveKafka
 import akka.stream.scaladsl.Keep
 import scala.concurrent.duration._
 import sandbox.util.DataGen
+import akka.kafka.ConsumerSettings
+import akka.kafka.ProducerSettings
+import org.apache.kafka.common.serialization.ByteArrayDeserializer
+import org.apache.kafka.common.serialization.ByteArraySerializer
+import org.apache.kafka.clients.producer.ProducerRecord
+import akka.kafka.scaladsl._
+import akka.kafka.Subscriptions
+import org.apache.kafka.clients.producer.ProducerConfig
+import scala.concurrent.Future
+import scala.concurrent.Await
+import java.util.concurrent.TimeoutException
 
 object NameAggregator extends App {
 
@@ -26,57 +33,60 @@ object NameAggregator extends App {
 
   val topicName = "names"
   val consumerGroupId = "name-consumer"
-  val broker = "192.168.99.100:9092"
+  val broker = "localhost:9092"
 
-  val consumerProps = ConsumerProperties(
-   bootstrapServers = broker,
-   topic = topicName,
-   groupId = consumerGroupId,
-   valueDeserializer = new StringDeserializer()
-  )
+  val consumerProps =
+    ConsumerSettings(system,new ByteArrayDeserializer, new StringDeserializer)
+      .withBootstrapServers(broker)
 
-  val producerProps = ProducerProperties(
-    bootstrapServers = broker,
-    topic = topicName,
-    valueSerializer = new StringSerializer()
-  )
+  val producerProps =
+    ProducerSettings(system, new ByteArraySerializer, new StringSerializer)
+      .withBootstrapServers(broker)
+      .withProperty(ProducerConfig.LINGER_MS_CONFIG, "3000")
 
   val rng = new scala.util.Random(new java.util.Random())
   try {
     val nameSource = Source.unfold(DataGen.name("US")){ gen =>
-      val delay = Math.abs(rng.nextGaussian()*3000L).toLong
-      Thread.sleep(delay)
+ //     val delay = Math.abs(rng.nextGaussian()*1000L).toLong
+ //     Thread.sleep(delay)
       gen.sample.map(n => (gen,n))
     }
 
-    val kafka = new ReactiveKafka()
+    val throttle = Source.tick(0.seconds, 1.second, ())
 
     val producer =
-      nameSource
-        .map(n => ProducerMessage(n))
+      (nameSource zip throttle).map{ case(a,b) => a }
+        .map(n => new ProducerRecord[Array[Byte],String](topicName, n))
         .alsoTo(Sink.foreach( n =>println("Publishing: "+n)))
-        .to(Sink.fromSubscriber(kafka.publish(producerProps)))
-
-    val consumerWithOffsetSink =
-      kafka.consumeWithOffsetSink(consumerProps)
+        .to(Producer.plainSink(producerProps))
 
     val start = System.currentTimeMillis
-    val consumer =
-      Source.fromPublisher(consumerWithOffsetSink.publisher)
-        .alsoTo(Sink.foreach( n =>println("Consuming: "+n)))
-        .groupedWithin(15,30.seconds)
-        .alsoTo(Sink.foreach( ns =>println(s"==> Aggregated: ${ns.map(_.value)} - ${ns.size} - ${System.currentTimeMillis - start}")))
-        .map(_.last)
-        .alsoTo(Sink.foreach(rec => println(s"===> Committing offset=${rec.offset}")))
-        .to(consumerWithOffsetSink.offsetCommitSink)
+    val consumer = Consumer.committableSource(consumerProps.withGroupId(consumerGroupId), Subscriptions.topics(topicName))
 
-    consumer.run()
+    val done = consumer
+      .alsoTo(Sink.foreach(rec => println(s"Consuming: ${rec}")))
+      .groupedWithin(15,30.seconds)
+      .alsoTo(Sink.foreach( recs =>println(s"==> Aggregated: ${recs.map(_.record.value)} - ${recs.size} - ${System.currentTimeMillis - start}")))
+      .mapAsync(1)(recs => Future{ if(recs.find(_.record.value.contains("SMITHY")).isDefined) throw new Exception("SMITH!!") else recs})
+      .map(_.last)
+      .alsoTo(Sink.foreach(rec => println(s"===> Committing: offset=${rec.committableOffset.partitionOffset.offset}")))
+      .mapAsync(1){ _.committableOffset.commitScaladsl() }
+      .runWith(Sink.ignore)
 
-    producer.run()
+    val bar = producer.run()
 
-    Thread.sleep(600000L)
+    try {
+      val res = waitFor(done,60.seconds)
+      println("Success: "+res)
+    }
+    catch {
+      case to: TimeoutException => println("Success")
+      case ex: Throwable => println("Failure: "+ex.getClass.getSimpleName+" - "+ex.getMessage)
+    }
   }
   finally {
     system.terminate()
   }
+
+  def waitFor[T](f: Future[T], d: Duration): T = Await.result(f,d)
 }
